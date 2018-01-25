@@ -1,0 +1,72 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+	<modelVersion>4.0.0</modelVersion>
+
+	<groupId>com.github.carterj3</groupId>
+	<artifactId>java-utilities</artifactId>
+	<version>0.0.1-SNAPSHOT</version>
+
+	<name>java-utilities</name>
+	<description>A collection of Java utility classes that have minimal dependencies on other projects</description>
+
+
+	<properties>
+		<java.version>1.9</java.version>
+		
+		<maven.compiler.source>${java.version}</maven.compiler.source>
+		<maven.compiler.target>${java.version}</maven.compiler.target>
+
+		<org.junit.jupiter-junit-jupiter-engine.version>5.0.2</org.junit.jupiter-junit-jupiter-engine.version>
+		<org.junit.platform-junit-platform-launcher.version>1.0.2</org.junit.platform-junit-platform-launcher.version>
+		<org.junit.vintage-junit-vintage-engine.version>4.12.2</org.junit.vintage-junit-vintage-engine.version>
+		
+		<org.checkerframework-checker.version>1.9.12</org.checkerframework-checker.version>
+	</properties>
+
+
+	<dependencies>
+
+		<dependency>
+			<groupId>org.junit.platform</groupId>
+			<artifactId>junit-platform-launcher</artifactId>
+			<version>${org.junit.platform-junit-platform-launcher.version}</version>
+			<scope>test</scope>
+		</dependency>
+
+		<dependency>
+			<groupId>org.junit.jupiter</groupId>
+			<artifactId>junit-jupiter-engine</artifactId>
+			<version>${org.junit.jupiter-junit-jupiter-engine.version}</version>
+			<scope>test</scope>
+		</dependency>
+
+		<dependency>
+			<groupId>org.junit.vintage</groupId>
+			<artifactId>junit-vintage-engine</artifactId>
+			<version>${org.junit.vintage-junit-vintage-engine.version}</version>
+			<scope>test</scope>
+		</dependency>
+
+		<dependency>
+			<groupId>org.checkerframework</groupId>
+			<artifactId>checker</artifactId>
+			<version>${org.checkerframework-checker.version}</version>
+		</dependency>
+	</dependencies>
+
+	<build>
+		<plugins>
+			<plugin>
+				<artifactId>maven-surefire-plugin</artifactId>
+				<version>2.19</version>
+				<dependencies>
+					<dependency>
+						<groupId>org.junit.platform</groupId>
+						<artifactId>junit-platform-surefire-provider</artifactId>
+						<version>1.0.0</version>
+					</dependency>
+				</dependencies>
+			</plugin>
+		</plugins>
+	</build>
+</project>
