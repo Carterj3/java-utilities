@@ -1,34 +1,30 @@
 package com.github.carterj3.utilities.concurrent.locks;
 
-import java.util.List;
 import java.util.Queue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReadWriteLock;
 
+import javax.validation.constraints.NotNull;
 
-/*
- * Goal: A ReentreantLock that after acquiring the ReadLock can be upgraded to be a WriteLock and then downgraded to ReadLock after the Write is finished.
- * 
- * try(? readLock = RUL.readLock().lock())
- * {
- * 		... (reading)
- * 
- * 		try(? writeLock = RUL.writeLock.lock())
- * 		try(? writeLock = readlock.upgrade())
- * 		{
- * 
- * 			
- * 		} // Implicitly call writeLock.downgrade() which leaves the readLock still acquired. 
- * }
- */
 public class ReentreantUpgradeLock implements ReadWriteLock {
 
+	/*
+	 * TODO: Investigate if each Thread can figure out who the next Thread to call
+	 * is so that instead of storing this information in a Queue it'd be store in
+	 * the Stack.
+	 */
 	private Queue<Thread> waitingThreads;
-	private List<Thread> readLockOwners;
+
+	private AtomicLong numberOfReadLockOwners;
+	private ConcurrentMap<Thread, AtomicLong> readLockOwners;
+
+	private AtomicLong numberOfWriteLockOwners;
 	private AtomicReference<Thread> writeLockOwner;
 
 	private UpgradableReadLock readLock;
@@ -36,95 +32,169 @@ public class ReentreantUpgradeLock implements ReadWriteLock {
 
 	public ReentreantUpgradeLock() {
 		this.waitingThreads = new ConcurrentLinkedQueue<>();
-		this.readLockOwners = new CopyOnWriteArrayList<>();
+
+		this.numberOfReadLockOwners = new AtomicLong(0L);
+		this.readLockOwners = new ConcurrentHashMap<>();
+
+		this.numberOfWriteLockOwners = new AtomicLong(0L);
 		this.writeLockOwner = new AtomicReference<>();
 
 		this.readLock = new UpgradableReadLock(this);
 		this.writeLock = new DowngradableWriteLock(this);
 	}
 
+	@NotNull
 	public UpgradableReadLock readLock() {
 		return readLock;
 	}
 
+	@NotNull
 	public DowngradableWriteLock writeLock() {
 		return writeLock;
 	}
 
-	void lockReadLock() {
-		Thread current = Thread.currentThread();
+	boolean tryLockReadLock(long arg0, @NotNull TimeUnit arg1, boolean isInterruptable) throws InterruptedException {
+		Thread currentThread = Thread.currentThread();
+		AtomicLong currentCounter = readLockOwners.computeIfAbsent(currentThread, key -> new AtomicLong(0L));
 
-		if (current == writeLockOwner.get()) {
-			readLockOwners.add(current);
-			return;
+		if (currentThread == writeLockOwner.get()) {
+			/*
+			 * The current thread cannot release the writeLock while it is acquiring the
+			 * readLock so this is thread-safe.
+			 */
+			numberOfReadLockOwners.incrementAndGet();
+			currentCounter.incrementAndGet();
+			return true;
 		}
 
-		if (readLockOwners.contains(current)) {
-			readLockOwners.add(current);
-			return;
+		if (readLockOwners.get(currentThread).get() > 0) {
+			/*
+			 * The current thread cannot release a readLock while it is acquiring another
+			 * readLock so this is thread-safe.
+			 */
+			numberOfReadLockOwners.incrementAndGet();
+			currentCounter.incrementAndGet();
+			return true;
 		}
 
-		waitingThreads.add(current);
-		boolean wasInterrupted = false;
-		while (!writeLockOwner.compareAndSet(null, current)) {
-			LockSupport.park();
-
-			// Check Thread.interrupted() first to clear it
-			wasInterrupted = Thread.interrupted() || wasInterrupted;
-		}
-
-		waitingThreads.remove(current);
-		readLockOwners.add(current);
-		writeLockOwner.set(null);
-
-		if (wasInterrupted) {
-			current.interrupt();
-		}
-	}
-
-	boolean tryLockReadLock(long arg0, TimeUnit arg1) throws InterruptedException {
-		Thread current = Thread.currentThread();
-
-		if (current == writeLockOwner.get()) {
-			return readLockOwners.add(current);
-		}
-
-		if (readLockOwners.contains(current)) {
-			return readLockOwners.add(current);
-		}
-
-		waitingThreads.add(current);
+		waitingThreads.add(currentThread);
 		long maximumDuration = arg1.toNanos(arg0);
 		long startTime = System.nanoTime();
-		while (!writeLockOwner.compareAndSet(null, current)) {
+		boolean wasInterrupted = false;
+		while (!writeLockOwner.compareAndSet(null, currentThread)) {
 
 			long duration = System.nanoTime() - startTime;
-			if (duration <= 0) {
-				waitingThreads.remove(current);
+			if (duration > maximumDuration) {
+				waitingThreads.remove(currentThread);
 				return false;
 			}
 
-			LockSupport.parkNanos(this, maximumDuration - duration);
+			LockSupport.parkNanos(maximumDuration - duration);
 
 			if (Thread.interrupted()) {
-				waitingThreads.remove(current);
-				throw new InterruptedException();
+
+				if (isInterruptable) {
+					waitingThreads.remove(currentThread);
+					throw new InterruptedException();
+				} else {
+					wasInterrupted = true;
+				}
 			}
 		}
 
-		waitingThreads.remove(current);
+		numberOfReadLockOwners.incrementAndGet();
+		currentCounter.incrementAndGet();
 		writeLockOwner.set(null);
-		return readLockOwners.add(current);
+		waitingThreads.remove(currentThread);
+
+		LockSupport.unpark(waitingThreads.peek());
+
+		if (wasInterrupted) {
+			currentThread.interrupt();
+		}
+
+		return true;
 	}
 
 	void unlockReadLock() {
-		Thread current = Thread.currentThread();
+		Thread currentThread = Thread.currentThread();
+		AtomicLong currentCounter = readLockOwners.computeIfAbsent(currentThread, key -> new AtomicLong(0L));
 
-		if (readLockOwners.remove(current)) {
-			waitingThreads.forEach(thread -> LockSupport.unpark(thread));
-		} else {
+		if (!(currentCounter.get() > 0)) {
 			throw new IllegalStateException("Cannot release Lock that is not owned by the thread");
 		}
+
+		currentCounter.decrementAndGet();
+		numberOfReadLockOwners.decrementAndGet();
+
+		LockSupport.unpark(writeLockOwner.get());
+		LockSupport.unpark(waitingThreads.peek());
+	}
+
+	boolean tryLockWriteLock(long arg0, @NotNull TimeUnit arg1, boolean isInterruptable) throws InterruptedException {
+		Thread currentThread = Thread.currentThread();
+		AtomicLong currentCounter = readLockOwners.computeIfAbsent(currentThread, key -> new AtomicLong(0L));
+
+		if (currentThread == writeLockOwner.get()) {
+			/*
+			 * The current thread cannot release the writeLock while it is acquiring the
+			 * writeLock so this is thread-safe.
+			 */
+			numberOfWriteLockOwners.incrementAndGet();
+			tryLockReadLock(arg0, arg1, isInterruptable);
+			return true;
+		}
+
+		waitingThreads.add(currentThread);
+		long maximumDuration = arg1.toNanos(arg0);
+		long startTime = System.nanoTime();
+		boolean wasInterrupted = false;
+		while (!((currentThread.equals(writeLockOwner.get()) || writeLockOwner.compareAndSet(null, currentThread))
+				&& (numberOfReadLockOwners.get() == currentCounter.get()))) {
+
+			long duration = System.nanoTime() - startTime;
+			if (duration > maximumDuration) {
+				waitingThreads.remove(currentThread);
+				return false;
+			}
+
+			LockSupport.parkNanos(maximumDuration - duration);
+
+			if (Thread.interrupted()) {
+
+				if (isInterruptable) {
+					waitingThreads.remove(currentThread);
+					throw new InterruptedException();
+				} else {
+					wasInterrupted = true;
+				}
+			}
+		}
+
+		numberOfWriteLockOwners.incrementAndGet();
+		tryLockReadLock(arg0, arg1, isInterruptable);
+		waitingThreads.remove(currentThread);
+
+		if (wasInterrupted) {
+			currentThread.interrupt();
+		}
+
+		return true;
+	}
+
+	void unlockWriteLock() {
+		Thread currentThread = Thread.currentThread();
+
+		if (!(currentThread.equals(writeLockOwner.get()))) {
+			throw new IllegalStateException("Cannot release Lock that is not owned by the thread");
+		}
+
+		unlockReadLock();
+		if (numberOfWriteLockOwners.decrementAndGet() == 0) {
+			writeLockOwner.set(null);
+		}
+
+		LockSupport.unpark(waitingThreads.peek());
 	}
 
 }

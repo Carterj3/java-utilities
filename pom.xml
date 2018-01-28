@@ -12,19 +12,32 @@
 
 	<properties>
 		<java.version>1.9</java.version>
-		
+
 		<maven.compiler.source>${java.version}</maven.compiler.source>
 		<maven.compiler.target>${java.version}</maven.compiler.target>
+
+		<org.checkerframework-checker.version>1.9.12</org.checkerframework-checker.version>
 
 		<org.junit.jupiter-junit-jupiter-engine.version>5.0.2</org.junit.jupiter-junit-jupiter-engine.version>
 		<org.junit.platform-junit-platform-launcher.version>1.0.2</org.junit.platform-junit-platform-launcher.version>
 		<org.junit.vintage-junit-vintage-engine.version>4.12.2</org.junit.vintage-junit-vintage-engine.version>
-		
-		<org.checkerframework-checker.version>1.9.12</org.checkerframework-checker.version>
+
 	</properties>
 
 
 	<dependencies>
+
+		<!-- Checker may be excess, probably should investigate if any jsr-305 
+			annotations defaultly exist. -->
+
+		<dependency>
+			<groupId>org.checkerframework</groupId>
+			<artifactId>checker</artifactId>
+			<version>${org.checkerframework-checker.version}</version>
+		</dependency>
+
+		<!-- JUnit is only used for testing so it's dependency is transparent to 
+			importers of the library. -->
 
 		<dependency>
 			<groupId>org.junit.platform</groupId>
@@ -47,11 +60,6 @@
 			<scope>test</scope>
 		</dependency>
 
-		<dependency>
-			<groupId>org.checkerframework</groupId>
-			<artifactId>checker</artifactId>
-			<version>${org.checkerframework-checker.version}</version>
-		</dependency>
 	</dependencies>
 
 	<build>
