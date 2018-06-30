@@ -1,4 +1,4 @@
-package com.github.carterj3.utilities;
+package com.github.carterj3.utilities.concurrent.locks;
 
 import java.util.ArrayList;
 import java.util.List;

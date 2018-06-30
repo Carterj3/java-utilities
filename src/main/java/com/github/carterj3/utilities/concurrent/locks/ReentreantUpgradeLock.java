@@ -1,17 +1,29 @@
 package com.github.carterj3.utilities.concurrent.locks;
 
 import java.util.Queue;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock.ReadLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock.WriteLock;
 
 import javax.validation.constraints.NotNull;
 
+import com.github.carterj3.utilities.NumberUtils;
+
+/**
+ * Implementation similar to {@link ReentrantReadWriteLock} but is capable of
+ * converting a {@link ReadLock} into a {@link WriteLock} as well as acquiring
+ * {@link ReadLock}s while that {@link Thread} holds a {@link WriteLock} and
+ * vice-versa.
+ * 
+ * @author jeffrey.carter
+ *
+ */
 public class ReentreantUpgradeLock implements ReadWriteLock {
 
 	/*
@@ -19,169 +31,223 @@ public class ReentreantUpgradeLock implements ReadWriteLock {
 	 * is so that instead of storing this information in a Queue it'd be store in
 	 * the Stack.
 	 */
+	/**
+	 * The {@link Thread}s waiting to acquire either a {@link ReadLock} or
+	 * {@link WriteLock}
+	 */
 	private Queue<Thread> waitingThreads;
 
+	/**
+	 * The total number of owners of a {@link ReadLock} (NOTE: each {@link Thread}
+	 * can hold multiple times)
+	 */
 	private AtomicLong numberOfReadLockOwners;
-	private ConcurrentMap<Thread, AtomicLong> readLockOwners;
 
-	private AtomicLong numberOfWriteLockOwners;
+	/**
+	 * How many times this {@link Thread} has currently acquired the
+	 * {@link ReadLock}
+	 */
+	private ThreadLocal<Long> readLockReentrantCounter;
+
+	/**
+	 * What {@link Thread} currently owns the {@link WriteLock}
+	 */
 	private AtomicReference<Thread> writeLockOwner;
 
+	/**
+	 * How many times this {@link Thread} has current acquired the {@link ReadLock}
+	 */
+	private ThreadLocal<Long> writeLockReentrantCounter;
+
+	/**
+	 * A cached {@link ReadLock} linked to this Lock to provide when requested
+	 */
 	private UpgradableReadLock readLock;
+
+	/**
+	 * A cached {@link WriteLock} linked to this lock to provide when requested
+	 */
 	private DowngradableWriteLock writeLock;
 
 	public ReentreantUpgradeLock() {
 		this.waitingThreads = new ConcurrentLinkedQueue<>();
 
 		this.numberOfReadLockOwners = new AtomicLong(0L);
-		this.readLockOwners = new ConcurrentHashMap<>();
+		this.readLockReentrantCounter = ThreadLocal.withInitial(() -> 0L);
 
-		this.numberOfWriteLockOwners = new AtomicLong(0L);
 		this.writeLockOwner = new AtomicReference<>();
+		this.writeLockReentrantCounter = ThreadLocal.withInitial(() -> 0L);
 
 		this.readLock = new UpgradableReadLock(this);
 		this.writeLock = new DowngradableWriteLock(this);
 	}
 
+	@Override
+	public String toString() {
+		return String.format("rlOwners: %d (%d), wlOwners: %s (%d), waiting: %s", numberOfReadLockOwners.get(),
+				readLockReentrantCounter.get(), writeLockOwner.get(), writeLockReentrantCounter.get(), waitingThreads);
+	}
+
 	@NotNull
+	@Override
 	public UpgradableReadLock readLock() {
 		return readLock;
 	}
 
 	@NotNull
+	@Override
 	public DowngradableWriteLock writeLock() {
 		return writeLock;
 	}
 
-	boolean tryLockReadLock(long arg0, @NotNull TimeUnit arg1, boolean isInterruptable) throws InterruptedException {
-		Thread currentThread = Thread.currentThread();
-		AtomicLong currentCounter = readLockOwners.computeIfAbsent(currentThread, key -> new AtomicLong(0L));
+	/**
+	 * Attempts to acquire the {@link ReadLock} within the specified time.
+	 * 
+	 * @param duration
+	 *            the amount of time to fail acquiring after
+	 * @param unit
+	 *            the {@link TimeUnit} associated with the duration
+	 * @param isInterruptable
+	 *            if true, throw an {@link InterruptedException} when the current
+	 *            {@link Thread} is interrupted
+	 * @return true if the {@link ReadLock} was acquired and false if time expired
+	 * @throws InterruptedException
+	 *             if `isInterruptable` was true and the current {@link Thread} and
+	 *             {@link Thread#interrupted()} became true
+	 */
+	boolean tryLockReadLock(long duration, @NotNull TimeUnit unit, boolean isInterruptable)
+			throws InterruptedException {
 
-		if (currentThread == writeLockOwner.get()) {
-			/*
-			 * The current thread cannot release the writeLock while it is acquiring the
-			 * readLock so this is thread-safe.
-			 */
-			numberOfReadLockOwners.incrementAndGet();
-			currentCounter.incrementAndGet();
+		/* Already have a ReadLock so just increment counters */
+		if (readLockReentrantCounter.get() > 0) {
+			readLockReentrantCounter.set(1 + readLockReentrantCounter.get());
+			this.numberOfReadLockOwners.incrementAndGet();
+
 			return true;
 		}
 
-		if (readLockOwners.get(currentThread).get() > 0) {
-			/*
-			 * The current thread cannot release a readLock while it is acquiring another
-			 * readLock so this is thread-safe.
-			 */
-			numberOfReadLockOwners.incrementAndGet();
-			currentCounter.incrementAndGet();
-			return true;
-		}
-
-		waitingThreads.add(currentThread);
-		long maximumDuration = arg1.toNanos(arg0);
+		/* Acquire the WriteLock temporarily since that means we can definitely Read */
 		long startTime = System.nanoTime();
-		boolean wasInterrupted = false;
-		while (!writeLockOwner.compareAndSet(null, currentThread)) {
+		long endTime = NumberUtils.INSTANCE.addWithDefault(Long.MAX_VALUE, startTime, unit.toNanos(duration));
+		Thread currentThread = Thread.currentThread();
 
-			long duration = System.nanoTime() - startTime;
-			if (duration > maximumDuration) {
-				waitingThreads.remove(currentThread);
+		this.waitingThreads.add(currentThread);
+
+		try {
+			if (!acquireWriteLock(isInterruptable, endTime)) {
 				return false;
 			}
 
-			LockSupport.parkNanos(maximumDuration - duration);
+			/* Have the WriteLock so increment the relevant Read counters */
+			this.readLockReentrantCounter.set(1 + readLockReentrantCounter.get());
+			this.numberOfReadLockOwners.incrementAndGet();
+			this.writeLockOwner.set(null);
 
-			if (Thread.interrupted()) {
+			/* Wake the next Thread in the Queue ( LockSupport::unpark has a null check ) */
+			LockSupport.unpark(waitingThreads.peek());
 
-				if (isInterruptable) {
-					waitingThreads.remove(currentThread);
-					throw new InterruptedException();
-				} else {
-					wasInterrupted = true;
-				}
-			}
+			return true;
+		} finally {
+			/* Even on Exceptions this Thread is no longer in the Queue */
+			this.waitingThreads.remove(currentThread);
 		}
 
-		numberOfReadLockOwners.incrementAndGet();
-		currentCounter.incrementAndGet();
-		writeLockOwner.set(null);
-		waitingThreads.remove(currentThread);
-
-		LockSupport.unpark(waitingThreads.peek());
-
-		if (wasInterrupted) {
-			currentThread.interrupt();
-		}
-
-		return true;
 	}
 
+	/**
+	 * Unlocks the {@link ReadLock} held by this {@link Thread}
+	 * 
+	 * @throws IllegalStateException
+	 *             if the current {@link Thread} does not hold a {@link ReadLock}
+	 */
 	void unlockReadLock() {
-		Thread currentThread = Thread.currentThread();
-		AtomicLong currentCounter = readLockOwners.computeIfAbsent(currentThread, key -> new AtomicLong(0L));
-
-		if (!(currentCounter.get() > 0)) {
+		if ((readLockReentrantCounter.get() < 1)
+				|| (readLockReentrantCounter.get() == writeLockReentrantCounter.get())) {
 			throw new IllegalStateException("Cannot release Lock that is not owned by the thread");
 		}
 
-		currentCounter.decrementAndGet();
+		readLockReentrantCounter.set(readLockReentrantCounter.get() - 1);
 		numberOfReadLockOwners.decrementAndGet();
 
-		LockSupport.unpark(writeLockOwner.get());
+		/* LockSupport::unpark has a null check */
 		LockSupport.unpark(waitingThreads.peek());
 	}
 
-	boolean tryLockWriteLock(long arg0, @NotNull TimeUnit arg1, boolean isInterruptable) throws InterruptedException {
-		Thread currentThread = Thread.currentThread();
-		AtomicLong currentCounter = readLockOwners.computeIfAbsent(currentThread, key -> new AtomicLong(0L));
+	/**
+	 * Attempts to acquire the {@link WriteLock} within the specified time.
+	 * 
+	 * @param duration
+	 *            the amount of time to fail acquiring after
+	 * @param unit
+	 *            the {@link TimeUnit} associated with the duration
+	 * @param isInterruptable
+	 *            if true, throw an {@link InterruptedException} when the current
+	 *            {@link Thread} is interrupted
+	 * @return true if the {@link WriteLock} was acquired and false if time expired
+	 * @throws InterruptedException
+	 *             if `isInterruptable` was true and the current {@link Thread} and
+	 *             {@link Thread#interrupted()} became true
+	 */
+	boolean tryLockWriteLock(long duration, @NotNull TimeUnit unit, boolean isInterruptable)
+			throws InterruptedException {
 
-		if (currentThread == writeLockOwner.get()) {
-			/*
-			 * The current thread cannot release the writeLock while it is acquiring the
-			 * writeLock so this is thread-safe.
-			 */
-			numberOfWriteLockOwners.incrementAndGet();
-			tryLockReadLock(arg0, arg1, isInterruptable);
+		/* Already have a WriteLock so just increment counters */
+		if (writeLockReentrantCounter.get() > 0) {
+			writeLockReentrantCounter.set(1 + writeLockReentrantCounter.get());
+			readLockReentrantCounter.set(1 + readLockReentrantCounter.get());
+			this.numberOfReadLockOwners.incrementAndGet();
 			return true;
 		}
 
-		waitingThreads.add(currentThread);
-		long maximumDuration = arg1.toNanos(arg0);
 		long startTime = System.nanoTime();
-		boolean wasInterrupted = false;
-		while (!((currentThread.equals(writeLockOwner.get()) || writeLockOwner.compareAndSet(null, currentThread))
-				&& (numberOfReadLockOwners.get() == currentCounter.get()))) {
+		long endTime = NumberUtils.INSTANCE.addWithDefault(Long.MAX_VALUE, startTime, unit.toNanos(duration));
+		Thread currentThread = Thread.currentThread();
 
-			long duration = System.nanoTime() - startTime;
-			if (duration > maximumDuration) {
-				waitingThreads.remove(currentThread);
+		this.waitingThreads.add(currentThread);
+
+		try {
+			/* Acquire WriteLock to prevent future Threads from becoming readers */
+			if (!acquireWriteLock(isInterruptable, endTime)) {
 				return false;
 			}
 
-			LockSupport.parkNanos(maximumDuration - duration);
+			/* Wait until only this Thread is a reader */
+			while (numberOfReadLockOwners.get() != readLockReentrantCounter.get()) {
+				LockSupport.parkNanos(endTime - System.nanoTime());
 
-			if (Thread.interrupted()) {
-
-				if (isInterruptable) {
-					waitingThreads.remove(currentThread);
+				if (isInterruptable && Thread.interrupted()) {
+					writeLockOwner.set(null);
+					LockSupport.unpark(waitingThreads.peek());
 					throw new InterruptedException();
-				} else {
-					wasInterrupted = true;
+				}
+
+				if (endTime >= System.nanoTime()) {
+					writeLockOwner.set(null);
+					LockSupport.unpark(waitingThreads.peek());
+					return false;
 				}
 			}
+
+			/* No other Thread is Reading or Writing so increment counters */
+			writeLockReentrantCounter.set(1 + writeLockReentrantCounter.get());
+			readLockReentrantCounter.set(1 + readLockReentrantCounter.get());
+			this.numberOfReadLockOwners.incrementAndGet();
+
+			LockSupport.unpark(waitingThreads.peek());
+
+			return true;
+		} finally {
+			this.waitingThreads.remove(currentThread);
 		}
 
-		numberOfWriteLockOwners.incrementAndGet();
-		tryLockReadLock(arg0, arg1, isInterruptable);
-		waitingThreads.remove(currentThread);
-
-		if (wasInterrupted) {
-			currentThread.interrupt();
-		}
-
-		return true;
 	}
 
+	/**
+	 * Unlocks the {@link WriteLock} held by this {@link Thread}
+	 * 
+	 * @throws IllegalStateException
+	 *             if the current {@link Thread} does not hold a {@link WriteLock}
+	 */
 	void unlockWriteLock() {
 		Thread currentThread = Thread.currentThread();
 
@@ -189,12 +255,52 @@ public class ReentreantUpgradeLock implements ReadWriteLock {
 			throw new IllegalStateException("Cannot release Lock that is not owned by the thread");
 		}
 
-		unlockReadLock();
-		if (numberOfWriteLockOwners.decrementAndGet() == 0) {
+		writeLockReentrantCounter.set(writeLockReentrantCounter.get() - 1);
+		readLockReentrantCounter.set(readLockReentrantCounter.get() - 1);
+		this.numberOfReadLockOwners.decrementAndGet();
+
+		if (writeLockReentrantCounter.get() == 0) {
 			writeLockOwner.set(null);
+			LockSupport.unpark(waitingThreads.peek());
+		}
+	}
+
+	/**
+	 * Sets the {@link #writeLockOwner} if it is currently not set, otherwise waits
+	 * until the specified `endTime` for an opportunity to set the value.
+	 * 
+	 * @param isInterruptable
+	 *            if this method should throw {@link InterruptedException} when
+	 *            interrupted (NOTE: if false, this method won't gobble the
+	 *            interrupted flag)
+	 * @param endTime
+	 *            the time (in nanos) to stop waiting
+	 * @return true if the {@link #writeLockOwner} is now set to the currentThread,
+	 *         otherwise false
+	 * @throws InterruptedException
+	 *             if this {@link Thread} is interrupted while acquiring the
+	 *             {@link #writeLockOwner}
+	 */
+	private boolean acquireWriteLock(boolean isInterruptable, long endTime) throws InterruptedException {
+		Thread currentThread = Thread.currentThread();
+
+		if (currentThread.equals(writeLockOwner.get())) {
+			return true;
 		}
 
-		LockSupport.unpark(waitingThreads.peek());
+		while (!this.writeLockOwner.compareAndSet(null, currentThread)) {
+			LockSupport.parkNanos(endTime - System.nanoTime());
+
+			if (isInterruptable && Thread.interrupted()) {
+				throw new InterruptedException();
+			}
+
+			if (endTime <= System.nanoTime()) {
+				return false;
+			}
+		}
+
+		return true;
 	}
 
 }
