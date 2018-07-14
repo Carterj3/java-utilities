@@ -1,7 +1,6 @@
 package com.github.carterj3.utilities.concurrent.locks;
 
-import java.util.Queue;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -26,16 +25,22 @@ import com.github.carterj3.utilities.NumberUtils;
  */
 public class ReentreantUpgradeLock implements ReadWriteLock {
 
-	/*
-	 * TODO: Investigate if each Thread can figure out who the next Thread to call
-	 * is so that instead of storing this information in a Queue it'd be store in
-	 * the Stack.
-	 */
 	/**
-	 * The {@link Thread}s waiting to acquire either a {@link ReadLock} or
-	 * {@link WriteLock}
+	 * Node pointing to the last "Thread" in the tail so when future Threads attempt
+	 * to acquire the Lock they can place themselves last in line easily.
 	 */
-	private Queue<Thread> waitingThreads;
+	private AtomicReference<LockNode> tail;
+
+	/**
+	 * Node pointing to the current "Thread" that has the Lock so that when it gets
+	 * unlocked it can awake the Thread after it.</br>
+	 * 
+	 * NOTE: Each "Thread" puts themselves into the queue before doing any
+	 * operations so if a bunch of ReadLock's are acquired current will point to
+	 * "Thread"s that are going to finish acquiring the Lock very shortly but
+	 * current will keep getting updated so it'll be correct.
+	 */
+	private LockNode current;
 
 	/**
 	 * The total number of owners of a {@link ReadLock} (NOTE: each {@link Thread}
@@ -70,7 +75,8 @@ public class ReentreantUpgradeLock implements ReadWriteLock {
 	private DowngradableWriteLock writeLock;
 
 	public ReentreantUpgradeLock() {
-		this.waitingThreads = new ConcurrentLinkedQueue<>();
+		this.tail = new AtomicReference<>(null);
+		this.current = null;
 
 		this.numberOfReadLockOwners = new AtomicLong(0L);
 		this.readLockReentrantCounter = ThreadLocal.withInitial(() -> 0L);
@@ -84,8 +90,9 @@ public class ReentreantUpgradeLock implements ReadWriteLock {
 
 	@Override
 	public String toString() {
-		return String.format("rlOwners: %d (%d), wlOwners: %s (%d), waiting: %s", numberOfReadLockOwners.get(),
-				readLockReentrantCounter.get(), writeLockOwner.get(), writeLockReentrantCounter.get(), waitingThreads);
+		return String.format("rlOwners: %d (%d), wlOwners: %s (%d), tail: %s, current: %s",
+				numberOfReadLockOwners.get(), readLockReentrantCounter.get(), writeLockOwner.get(),
+				writeLockReentrantCounter.get(), tail, current);
 	}
 
 	@NotNull
@@ -126,14 +133,13 @@ public class ReentreantUpgradeLock implements ReadWriteLock {
 			return true;
 		}
 
-		/* Acquire the WriteLock temporarily since that means we can definitely Read */
 		long startTime = System.nanoTime();
 		long endTime = NumberUtils.INSTANCE.addWithDefault(Long.MAX_VALUE, startTime, unit.toNanos(duration));
 		Thread currentThread = Thread.currentThread();
-
-		this.waitingThreads.add(currentThread);
+		LockNode node = addNodeToQueue(currentThread);
 
 		try {
+			/* Acquire the WriteLock temporarily since that means we can definitely Read */
 			if (!acquireWriteLock(isInterruptable, endTime)) {
 				return false;
 			}
@@ -144,12 +150,12 @@ public class ReentreantUpgradeLock implements ReadWriteLock {
 			this.writeLockOwner.set(null);
 
 			/* Wake the next Thread in the Queue ( LockSupport::unpark has a null check ) */
-			LockSupport.unpark(waitingThreads.peek());
+			current = node;
+			LockSupport.unpark(node.getNext().get());
 
 			return true;
 		} finally {
-			/* Even on Exceptions this Thread is no longer in the Queue */
-			this.waitingThreads.remove(currentThread);
+			cleanupNodeQueue(node);
 		}
 
 	}
@@ -170,7 +176,7 @@ public class ReentreantUpgradeLock implements ReadWriteLock {
 		numberOfReadLockOwners.decrementAndGet();
 
 		/* LockSupport::unpark has a null check */
-		LockSupport.unpark(waitingThreads.peek());
+		LockSupport.unpark(current.getNext().get());
 	}
 
 	/**
@@ -202,8 +208,7 @@ public class ReentreantUpgradeLock implements ReadWriteLock {
 		long startTime = System.nanoTime();
 		long endTime = NumberUtils.INSTANCE.addWithDefault(Long.MAX_VALUE, startTime, unit.toNanos(duration));
 		Thread currentThread = Thread.currentThread();
-
-		this.waitingThreads.add(currentThread);
+		LockNode node = addNodeToQueue(currentThread);
 
 		try {
 			/* Acquire WriteLock to prevent future Threads from becoming readers */
@@ -217,13 +222,13 @@ public class ReentreantUpgradeLock implements ReadWriteLock {
 
 				if (isInterruptable && Thread.interrupted()) {
 					writeLockOwner.set(null);
-					LockSupport.unpark(waitingThreads.peek());
+					LockSupport.unpark(node.getNext().get());
 					throw new InterruptedException();
 				}
 
 				if (endTime >= System.nanoTime()) {
 					writeLockOwner.set(null);
-					LockSupport.unpark(waitingThreads.peek());
+					LockSupport.unpark(node.getNext().get());
 					return false;
 				}
 			}
@@ -233,11 +238,12 @@ public class ReentreantUpgradeLock implements ReadWriteLock {
 			readLockReentrantCounter.set(1 + readLockReentrantCounter.get());
 			this.numberOfReadLockOwners.incrementAndGet();
 
-			LockSupport.unpark(waitingThreads.peek());
+			current = node;
+			LockSupport.unpark(node.getNext().get());
 
 			return true;
 		} finally {
-			this.waitingThreads.remove(currentThread);
+			cleanupNodeQueue(node);
 		}
 
 	}
@@ -261,7 +267,7 @@ public class ReentreantUpgradeLock implements ReadWriteLock {
 
 		if (writeLockReentrantCounter.get() == 0) {
 			writeLockOwner.set(null);
-			LockSupport.unpark(waitingThreads.peek());
+			LockSupport.unpark(current.getNext().get());
 		}
 	}
 
@@ -301,6 +307,62 @@ public class ReentreantUpgradeLock implements ReadWriteLock {
 		}
 
 		return true;
+	}
+
+	/**
+	 * Cleans up the node queue.</br>
+	 * 
+	 * @param node
+	 *            the Node that is being removed from the queue.
+	 * @see #addNodeToQueue(Thread)
+	 */
+	private void cleanupNodeQueue(LockNode node) {
+		/* Need to fix the Queue if an Exception occurs */
+		if (tail.compareAndSet(node, null)) {
+			/* Fixed, nothing is after this node */
+			return;
+		}
+
+		/* Not the last node so can just fix pointers */
+		if (Objects.isNull(node.getPrevious())) {
+			/* Fixed, nothing came before this node */
+			LockSupport.unpark(node.getNext().get());
+			return;
+		}
+
+		node.getPrevious().getNext().set(node.getNext().get());
+		/* Fixed, previous points to next */
+		LockSupport.unpark(node.getNext().get());
+		return;
+	}
+
+	/**
+	 * Only the Tail & Current nodes are known by the Lock and each of the links are
+	 * stored on the stack inside the acquire lock functions. When a lock is
+	 * acquired the links can be removed because only the latest Thread that needs
+	 * to be awakened when a Lock is released needs to be known and is as `current`.
+	 * 
+	 * @param thread
+	 *            the thread to insert in the queue
+	 * @return a {@link LockNode} for this link in the queue
+	 */
+	private LockNode addNodeToQueue(Thread thread) {
+		LockNode node = new LockNode();
+
+		for (;;) {
+			LockNode previous = tail.compareAndExchange(null, node);
+			if (previous == null) {
+				/* No other threads are in the queue so don't need to fix the previous Thread */
+				return node;
+			}
+
+			if (previous.getNext().compareAndSet(null, thread)) {
+				/* Previous node points to this Thread now */
+				if (tail.compareAndSet(previous, node)) {
+					return node;
+				}
+			}
+		}
 	}
 
 }

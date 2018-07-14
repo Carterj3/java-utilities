@@ -45,7 +45,8 @@ public class ReentreantUpgradeLockTest {
 		Lock rwlRl = rwl.readLock();
 
 		/*
-		 * ReentrantReadWriteLock only supports 65535 concurrent attempts (to be fair, 65,535 threads is a lot).
+		 * ReentrantReadWriteLock only supports 65535 concurrent attempts (to be fair,
+		 * 65,535 threads is a lot).
 		 */
 		int cycles = 65535;
 
@@ -85,15 +86,29 @@ public class ReentreantUpgradeLockTest {
 		long rwlLockTime = rwlMidTime - rwlStartTime;
 		long rwlUnlockTime = System.nanoTime() - rwlMidTime;
 
-		// RUL: [7906503, 9766792]ns = [0.008, 0.010]s
-		// REL: [2413993, 2339919]ns = [0.002, 0.002]s
-		// RWL: [4994415, 4742409]ns = [0.005, 0.005]s
+		/*
+		 * These numbers need a huge grain of salt since if you rearrange the order of
+		 * when the blocks are run the times change significantly
+		 */
+		// RUL: [10108513, 7961890]ns [0.010, 0.008]s 154.246 ns/L, 121.491 ns/UL
+		// REL: [3164437, 2859529]ns [0.003, 0.003]s 48.286 ns/L, 43.634 ns/UL
+		// RWL: [6869648, 3825305]ns [0.007, 0.004]s 104.824 ns/L, 58.370 ns/UL
 
-		System.out.println(String.format(
-				"RUL: [%d, %d]ns = [%.3f, %.3f]s, REL: [%d, %d]ns = [%.3f, %.3f]s, RWL: [%d, %d]ns = [%.3f, %.3f]s",
-				rulLockTime, rulUnlockTime, rulLockTime / 1e9, rulUnlockTime / 1e9, relLockTime, relUnlockTime,
-				relLockTime / 1e9, relUnlockTime / 1e9, rwlLockTime, rwlUnlockTime, rwlLockTime / 1e9,
-				rwlUnlockTime / 1e9));
+		double rulLockPerNs = (rulLockTime / 1.0) / cycles;
+		double rulUnlockPerNs = (rulUnlockTime / 1.0) / cycles;
+
+		double relLockPerNs = (relLockTime / 1.0) / cycles;
+		double relUnlockPerNs = (relUnlockTime / 1.0) / cycles;
+
+		double rwlLockPerNs = (rwlLockTime / 1.0) / cycles;
+		double rwlUnlockPerNs = (rwlUnlockTime / 1.0) / cycles;
+
+		System.out.println(String.format("RUL: [%d, %d]ns \t [%.3f, %.3f]s \t %.3f ns/L, %.3f ns/UL", rulLockTime,
+				rulUnlockTime, rulLockTime / 1e9, rulUnlockTime / 1e9, rulLockPerNs, rulUnlockPerNs));
+		System.out.println(String.format("REL: [%d, %d]ns \t [%.3f, %.3f]s \t %.3f ns/L, %.3f ns/UL", relLockTime,
+				relUnlockTime, relLockTime / 1e9, relUnlockTime / 1e9, relLockPerNs, relUnlockPerNs));
+		System.out.println(String.format("RWL: [%d, %d]ns \t [%.3f, %.3f]s \t %.3f ns/L, %.3f ns/UL", rwlLockTime,
+				rwlUnlockTime, rwlLockTime / 1e9, rwlUnlockTime / 1e9, rwlLockPerNs, rwlUnlockPerNs));
 	}
 
 	@Test
